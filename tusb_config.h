@@ -13,7 +13,17 @@
  * #included a helper header would resolve for the sketch and fail with
  * "No such file or directory" inside cdc_device.c.
  *
- * Trimmed to what this demo needs: one host HID slot, no hub, no host CDC/MSC.
+ * EDITS HERE NEED `--clean`. arduino-cli does not treat this file as a
+ * dependency of the core's TinyUSB objects, so after you change a value the
+ * next plain `arduino-cli compile` can reuse core objects built with the
+ * PREVIOUS config and still print a plausible memory report. Observed when
+ * raising CFG_TUH_HID 1 -> 4: the cached build reported 10,240 B and linked
+ * one-slot arrays (_hidh_epbuf = 0x80); --clean reported 10,668 B and
+ * four-slot arrays (0x200). Verify with --clean, or inspect the ELF:
+ *   arm-none-eabi-nm -S <sketch>.elf | grep _hidh
+ *
+ * Trimmed to what this demo needs: four host HID slots (composite keyboards,
+ * see the host note), no hub, no host CDC/MSC.
  * The device stack is NOT trimmed, because two core files are compiled
  * unconditionally and require it (see the floor note below).
  */
@@ -47,7 +57,20 @@ extern "C" {
 
 // ---- Host stack ----
 #define CFG_TUH_ENABLED                      1
-#define CFG_TUH_HID                          1  // one keyboard, no hub
+// NOT one slot, and do not "trim" it back. hidh_open() claims ANY HID-class
+// interface (it matches bInterfaceClass only, not subclass or protocol), and a
+// composite keyboard exposes several: vendor/driver, consumer-control, sometimes
+// a mouse. With one slot the extra interfaces hit TU_ASSERT(p_hid, 0) in
+// hidh_set_config() and are discarded without tuh_hid_mount_cb() ever being
+// called for them — so if a vendor interface enumerates first it takes the only
+// slot, the real keyboard interface is dropped, and the sketch renders whatever
+// the vendor interface sends while row 3 reads "kbd decl". Four slots cover
+// keyboard + mouse + vendor + consumer-control (verified on a Holtek 04d9:1203,
+// which exposes a boot keyboard plus a 101-byte consumer/system interface).
+// Cost is measurable and small: four slots are 56 B of hidh_interface_t plus
+// 512 B of endpoint buffers, i.e. +426 B RAM over one slot. The sketch sits at
+// 10,676 B of 32,768 (32 %), leaving 22,092 B. Still no hub.
+#define CFG_TUH_HID                          4
 
 // ---- MCU / RHPort ----------------------------------------------------------
 // CFG_TUSB_MCU is NOT defined here: boards.txt passes

@@ -7,7 +7,7 @@ characters, the report itself.
 ```
 row 1   LC LS LA LG RC RS RA RG     a label appears while that modifier bit is set
 row 2   04 1E 00 00 00 00           the six keycodes, two hex digits each, in report order
-row 3   kbd ok                      mount status ("no kbd" until the keyboard mounts)
+row 3   kbd ok                      kbd ok = boot keyboard, kbd decl = as declared, no kbd = none
 ```
 
 Report byte 0 is the modifier bitmap (bit 0 L-Ctrl, bit 1 L-Shift, bit 2 L-Alt,
@@ -64,12 +64,24 @@ Both live in `~/Arduino/libraries` and are already installed on this machine.
 
 ```bash
 arduino-cli compile --fqbn unor4tinyusb:renesas_uno:nanor4 .
-arduino-cli upload  --fqbn unor4tinyusb:renesas_uno:nanor4 -p /dev/ttyACM0 .
+arduino-cli upload  --fqbn unor4tinyusb:renesas_uno:nanor4 --port 1-1 .
 ```
 
-Upload is DFU over the runtime port (`2341:0074`); no RESET-button dance needed.
+Upload goes over **DFU**, never a serial port. `arduino-cli board list` names the port by its USB
+topology path (observed `1-1`). Because this is USB *host* firmware, once it runs the board stops
+enumerating on the PC altogether — no `2341:0074`, no `/dev/ttyACM0`, nothing in `lsusb` — while
+5 V keeps it running and the OLED still displays. So there is no serial port to pass, and **to
+flash a second time you must double-tap RESET** to bring the DFU bootloader (`2341:0374`) back.
+The core's recipe, `dfu-util --device 0x2341:0x0074,:0x0374 -a0`, accepts the bootloader or the
+runtime PID, so either state uploads fine. A successful upload ends with `Download done.` /
+`Done!` and then `New upload port: 1-1 (dfu)`.
 
-Verified sizes: **70,116 B flash (26 % of 262,144) / 10,240 B RAM (31 % of 32,768)**.
+**If you change `tusb_config.h`, rebuild with `--clean`.** arduino-cli does not treat that file as a
+dependency of the core's TinyUSB sources, so a plain rebuild can silently reuse objects compiled
+with the old config — and still print a plausible memory report. `arm-none-eabi-nm -S
+<sketch>.elf | grep _hidh` shows what actually got built.
+
+Verified sizes: **71,176 B flash (27 % of 262,144) / 10,676 B RAM (32 % of 32,768)**.
 
 ## Console (optional)
 
@@ -79,18 +91,61 @@ the hardware UART: pin **D0 = RX**, **D1 = TX**, 115200 8N1, 3.3 V. Wire any USB
 adapter into those two pins to watch; with nothing attached the sketch still runs
 and the OLED still shows everything.
 
+Because host firmware makes the board invisible to the PC (see Build), this UART is
+the only window into what the USB stack is doing. A working Holtek
+`04d9:1203` composite keypad produces exactly this, and **the order matters** —
+`boot protocol set` must come last:
+
+```
+[kbd] hid mount dev=1 idx=0 itf=1 desc=62    IF0 is a boot keyboard; desc = report desc length
+[kbd] hid mount dev=1 idx=1 itf=0 desc=101   IF1 consumer/system controls; ignored on screen
+[kbd] mount dev=1 vid=04D9 pid=1203 ready=1  every interface configured, device ready
+[kbd] boot protocol set dev=1 idx=0          canonical 8-byte reports confirmed
+[kbd] mod=00 keys=5F 00 00 00 00 00          one line per changed report (5F = KP7)
+```
+
+If `boot protocol set` appears *before* the second `hid mount`, the control
+transfer was issued too early and derailed the rest of enumeration: the OLED still
+reads `kbd ok`, but no report can ever arrive. Lines that mean something is wrong:
+
+```
+[kbd] set_protocol FAILED ... staying in report protocol    switch refused -> "kbd decl"
+[kbd] receive_report could not arm idx=N                    IN endpoint not claimed -> deaf
+[kbd] device-level mount did not complete, starting anyway   an interface stalled enumeration
+[kbd] short report len=N                                    not the 8-byte boot report
+```
+
 ## Troubleshooting
 
 - **OLED blank, sketch running** — the Qwiic connector is `Wire1` (pins 26/27),
   not `Wire` (the A4/A5 pair). `begin()` defaults to `Wire`, so the sketch must
   call `Wire1.begin()` **and** pass it: `myOLED.begin(Wire1)`.
-- **Keyboard never mounts** — bus-powered keyboard without the power splitter.
-  Check `lsusb` and the console `mount` line.
+- **Keyboard never mounts** — most often a bus-powered keyboard without the
+  power splitter, so it never sees a powered bus. Look for a
+  `[kbd] mount dev=... vid=... pid=...` line on the console; no such line means
+  the keyboard is not even enumerating. `lsusb` on your computer cannot help
+  here: the Nano R4 *is* the host, so nothing downstream of it ever appears on
+  your machine's bus.
 - **Only the first report shows** — the report callback must re-arm with
   `tuh_hid_receive_report()`; without it the keyboard reports exactly once.
-- **Row 1 shows nothing while keys are held** — the keyboard may not implement
-  the boot interface; the sketch falls back to whatever it declared and says so
-  on the console.
+- **`kbd decl` instead of `kbd ok`** — the interface on the display is not in HID
+  boot protocol, so the screen shows that interface's own report layout rather
+  than the canonical 8-byte keyboard report. Either the keyboard exposes no boot
+  interface, or `SET_PROTOCOL` failed — the console says which. The byte layout
+  can differ, so rows 1 and 2 need not line up with the modifier/keycode fields.
+- **`kbd ok` but row 2 never changes** — check the *order* of console lines (see
+  Console). `boot protocol set` printing before every interface has mounted means
+  the control transfer was issued from inside the mount callback and derailed the
+  rest of enumeration: the follow-on interface never configured, so the
+  device-level mount never happened and no report ever arrived. The console shows
+  no error at all, and the device *is* configured — a stalled driver pass is
+  invisible from the outside.
+- **Mounts, but row 2 stays blank or shows nonsense** — composite keyboards
+  expose several HID interfaces (vendor/driver, consumer control, sometimes a
+  mouse), and TinyUSB claims any of them. The sketch selects the one it reports
+  as a boot keyboard instead of assuming index 0, but that needs a slot per
+  interface: keep `CFG_TUH_HID` at 4. With a single slot the keyboard interface
+  is dropped during enumeration and never mounts.
 
 ## Acknowledgments
 

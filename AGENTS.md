@@ -10,20 +10,52 @@ works when the board is plugged in, but the only real check is looking at the OL
 
 ```bash
 arduino-cli compile --fqbn unor4tinyusb:renesas_uno:nanor4 .
-arduino-cli upload  --fqbn unor4tinyusb:renesas_uno:nanor4 -p /dev/ttyACM0 .
+arduino-cli upload  --fqbn unor4tinyusb:renesas_uno:nanor4 --port 1-1 .
 ```
 
-Verified: **70,116 B flash (26 % of 262,144) / 10,240 B RAM (31 % of 32,768)**. RAM is the
+`--port 1-1` is the DFU port `arduino-cli board list` reports for this board; there is no serial
+port to name, see below. Run `arduino-cli board list` to get the current topology path.
+
+Verified: **71,176 B flash (27 % of 262,144) / 10,676 B RAM (32 % of 32,768)**. RAM is the
 binding constraint; the OLED's own graphics buffer is 512 B of it.
 
-Upload is DFU over the **runtime** port: `lsusb` shows `2341:0074`, `dfu-util --list` reports
-`name="DFU-RT Port"`, load address `0x00010000`. No RESET dance. A successful upload ends with
-`Download done.` then `New upload port: /dev/ttyACM0 (serial)`. Kill any serial monitor first —
-a held port blocks DFU enumeration.
+**After editing `tusb_config.h`, build with `--clean`.** arduino-cli does not track that file as a
+dependency of the core's TinyUSB objects, so a plain rebuild can reuse objects compiled with the
+*previous* config and still print a plausible memory report. Seen directly when raising
+`CFG_TUH_HID 1 -> 4`: the cached build reported 10,240 B and one-slot arrays (`_hidh_epbuf` =
+`0x80`); `--clean` reported 10,668 B and four-slot arrays (`0x200`). Confirm with
+`arm-none-eabi-nm -S <sketch>.elf | grep _hidh`.
 
-**Verified on hardware** (2026-11-05, bench): with the USB power splitter cable attached, a real
-keyboard's reports render correctly — the modifier row lights per bit and the six keycode cells
-track the report. Not tested without the splitter.
+**This is host firmware, so the usual Nano R4 upload story does not hold.** `tuh_arduino_init()`
+makes rhport 0 a USB host, so once the app runs the board stops enumerating on the PC entirely: no
+`2341:0074`, no `/dev/ttyACM0`, nothing in `lsusb`. 5 V still arrives from the port, so the sketch
+and the OLED run blind. That is why there is no serial port to pass to `--port`.
+
+Target DFU instead. `arduino-cli board list` shows the board under its USB topology path with
+protocol `dfu` (observed `1-1`). The board comes back as the **bootloader** `2341:0374`, not the
+runtime `2341:0074` / `name="DFU-RT Port"` — both are fine, because the core's recipe is
+`dfu-util --device 0x2341:0x0074,:0x0374 -a0`, which matches either. A successful upload ends with
+`Download done.` / `Done!` and then `New upload port: 1-1 (dfu)`, **not** `... ttyACM0 (serial)`.
+
+**Re-flashing requires the bootloader back.** With this host build running the board never
+re-enumerates, so a plain `arduino-cli upload` finds no port at all — double-tap RESET to enter the
+DFU bootloader (`2341:0374`), then upload. The device-firmware case (runtime `2341:0074`, load
+address `0x00010000`, "no RESET dance") no longer applies once host firmware is on the board. Kill
+any serial monitor first; a held port blocks enumeration.
+
+Verified uploading the `CFG_TUH_HID 4` build: board arrived in bootloader mode `2341:0374`,
+`--port 1-1` wrote 70,744 B, ended `Download done.` → `Done!`, then the board disappeared from
+`lsusb` exactly as expected above. The double-tap recovery is the standard Nano R4 route and was
+**not** re-run in that session.
+
+**Verified on hardware** (2026-11-08, bench, Holtek `04d9:1203` composite numeric keypad, bus
+powered through the splitter): both HID interfaces mount, `kbd ok` is reached, and the six keycode
+cells track the report — `KP7`/`KP8`/`KP9`/`KP5` show as `5F`/`60`/`61`/`5D` and return to all
+zeros on release. Row 1 stays blank on this device **by design**: a numpad sends no modifiers, so an
+empty modifier row here is not a fault. An earlier run (2026-11-05) covered a single-interface
+keyboard. Not tested without the splitter. Still **not** exercised on hardware: the `kbd decl`
+fallback branch, the takeover-from-a-vendor-interface path, and the `loop()` safety net, which never
+fired because the deferred `set_protocol` is what makes enumeration complete.
 
 **Do NOT add `sketch.yaml`.** With one present, arduino-cli 1.5.1 stops adding `-I` for user
 libraries: the build fails at `#include <UnoR4TinyUSB.h>` with `Alternatives for UnoR4TinyUSB.h: []`
@@ -54,17 +86,50 @@ inside the core (`.../renesas_uno/1.6.0/libraries/Wire`), which is what `SparkFu
 
 ## Sketch notes
 
-- `tusb_config.h` is trimmed to one host HID slot (`CFG_TUH_HID 1`, no HUB, no host CDC/MSC).
+- `tusb_config.h` is trimmed to four host HID slots (`CFG_TUH_HID 4`, no HUB, no host CDC/MSC).
+  Four, not one, because `hidh_open()` claims **any** HID-class interface and a composite keyboard
+  exposes several: with a single slot a vendor interface that enumerates first drives
+  `hidh_set_config()` into `TU_ASSERT(p_hid, 0)` and the real keyboard interface is dropped
+  without `tuh_hid_mount_cb` ever running for it. Do not lower it back.
   `CFG_TUD_ENABLED 1` and `CFG_TUD_CDC 1` are **floors, not choices**: `USB.cpp` builds a
   `TUD_CDC_DESCRIPTOR` outside any `#if` and `__USBStart()` calls `tud_rhport_init()`, and
   `SerialUSB.cpp`'s `_SerialUSB` object calls `tud_cdc_*`. Zeroing them fails to compile the **core**.
   The file must stay self-contained — the core's TinyUSB TUs get five include dirs, none of them
   the sketch folder or `src/`, so a config that `#include`s a helper header fails with
   "No such file or directory" inside `cdc_device.c`.
-- `tuh_hid_set_protocol(daddr, idx, 0)` forces the **HID boot protocol**, so reports are the
-  canonical 8 bytes whatever the keyboard declared. On failure the sketch falls back to receiving
-  as declared and says so. Exactly one `tuh_hid_receive_report()` arming per interface: `mount_cb`
-  arms only when `set_protocol` failed, otherwise `tuh_hid_set_protocol_complete_cb` arms it.
+- **The keyboard is chosen by interface protocol, never by index.** Since TinyUSB claims any
+  HID-class interface, `idx 0` is only "whatever enumerated first". `tuh_hid_mount_cb` reads
+  `tuh_hid_interface_protocol(daddr, idx)` and claims the `HID_ITF_PROTOCOL_KEYBOARD` one; a
+  non-boot interface is kept only as a fallback so a boot-interface-less keyboard still displays
+  (`HID_ITF_PROTOCOL_MOUSE` never is), and a real boot keyboard appearing later takes the slot
+  over. Reports from any other index are dropped and left **un**-armed, so they go quiet after the
+  one report that identified them. Row 3 tells the states apart: `kbd ok` (confirmed boot
+  protocol), `kbd decl` (mounted, rendered as declared), `no kbd`.
+- **Never issue a control transfer from `tuh_hid_mount_cb`.** It runs from
+  `config_driver_mount_complete()`, i.e. from inside a control-transfer completion, while TinyUSB is
+  still walking the remaining interfaces in its driver-configuration pass. Calling
+  `tuh_hid_set_protocol()` there derailed that pass on a Holtek `04d9:1203` keypad: the follow-on
+  interface never configured, `tuh_mount_cb` never fired, and no report ever arrived. Symptom:
+  `kbd ok` on the OLED, dead hex digits, and **no error on the console whatsoever**. Do it from
+  `tuh_mount_cb` instead — `usbh.c` reaches it only after every interface has configured — which is
+  what `startKeyboard()` exists for. Two tempting explanations are both **wrong**, so do not
+  re-derive either. The device *was* configured: `SET_CONFIGURATION` is an earlier enumeration step
+  than driver configuration (the next step after it is `ENUM_CONFIG_DRIVER`). And reception *was*
+  requested: the protocol-complete callback ran — `boot protocol set` is printed from it — and
+  called `tuh_hid_receive_report()`. Whether that call succeeded is genuinely unknown, because the
+  code then discarded its return value (exactly the failure mode `armReceive()` now makes visible).
+  Why a stalled driver pass should silence an endpoint on a configured device is **not understood**;
+  the fix rests on the A/B, not on a mechanism.
+- **Never ignore `tuh_hid_receive_report()`'s return value.** A false return means the IN endpoint
+  was not claimed, and nothing re-arms it afterwards: the keyboard is permanently deaf with no other
+  symptom. `armReceive()` logs it; that log is the only way this failure mode is visible.
+- `tuh_hid_set_protocol(daddr, idx, HID_PROTOCOL_BOOT)` forces the **HID boot protocol**, so
+  reports are the canonical 8 bytes whatever the interface declared. `set_protocol_complete()` in
+  `hid_host.c` invokes `tuh_hid_set_protocol_complete_cb` **whether or not the transfer
+  succeeded**, and only updates its own mode on success — so the `protocol` argument is the only
+  honest signal, and "boot protocol set" must never be logged unconditionally. Exactly one
+  `tuh_hid_receive_report()` arming: `mount_cb` arms only when `set_protocol` could not even queue
+  the control transfer (then no callback will follow), otherwise the complete callback arms it.
 - `tuh_hid_report_received_cb` must end with `tuh_hid_receive_report()` — without it the keyboard
   reports exactly once.
 - **OLED redraw idiom:** there is no `clear()`. `erase()` blanks the dirty regions of the local
